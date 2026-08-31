@@ -1,0 +1,835 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Drift</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    background: #060613;
+    width: 100%;
+    height: 100%;
+    cursor: none;
+  }
+  canvas {
+    display: block;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+  }
+  #hint {
+    position: fixed;
+    left: 50%;
+    bottom: 22px;
+    transform: translateX(-50%);
+    font-family: 'Courier New', monospace;
+    color: rgba(190, 200, 230, 0.35);
+    font-size: 12px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    pointer-events: none;
+    transition: opacity 2s ease;
+    user-select: none;
+    text-align: center;
+  }
+  #cursor {
+    position: fixed;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: rgba(255,255,255,0.5);
+    pointer-events: none;
+    transform: translate(-50%, -50%);
+    box-shadow: 0 0 6px rgba(255,255,255,0.4);
+    transition: transform 0.08s ease, background 0.08s ease;
+  }
+  #recStatus {
+    position: fixed;
+    top: 16px;
+    right: 18px;
+    font-family: 'Courier New', monospace;
+    font-size: 12px;
+    letter-spacing: 1.5px;
+    color: rgba(230, 230, 240, 0.75);
+    pointer-events: none;
+    user-select: none;
+    display: none;
+    align-items: center;
+    gap: 7px;
+    background: rgba(10, 10, 20, 0.35);
+    padding: 5px 10px;
+    border-radius: 3px;
+  }
+  #recStatus.visible { display: flex; }
+  #recDot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #ff4d4d;
+    box-shadow: 0 0 6px #ff4d4d;
+    animation: recBlink 1s steps(1) infinite;
+  }
+  #recStatus.encoding #recDot {
+    background: #ffd166;
+    box-shadow: 0 0 6px #ffd166;
+    animation: none;
+  }
+  @keyframes recBlink {
+    0%, 49% { opacity: 1; }
+    50%, 100% { opacity: 0.15; }
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint">move the mouse to drift · click to boost · press R to record a gif</div>
+<div id="cursor"></div>
+<div id="recStatus"><span id="recDot"></span><span id="recLabel">REC</span></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/gif.js/0.2.0/gif.js"></script>
+<script>
+(function() {
+  "use strict";
+
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+
+  const SCALE = 3;
+  let W = 0, H = 0; // low-res dims — this IS the entire world, single fixed screen
+  let screenW = 0, screenH = 0;
+
+  function resize() {
+    screenW = window.innerWidth;
+    screenH = window.innerHeight;
+    W = Math.floor(screenW / SCALE);
+    H = Math.floor(screenH / SCALE);
+    canvas.width = W;
+    canvas.height = H;
+    canvas.style.width = screenW + 'px';
+    canvas.style.height = screenH + 'px';
+    layoutPlanets();
+  }
+
+  const cursorEl = document.getElementById('cursor');
+  const hintEl = document.getElementById('hint');
+
+  function rand(a, b) { return a + Math.random() * (b - a); }
+  function choice(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+
+  // ---------- Mouse / input ----------
+  const mouse = { x: 0, y: 0, active: false };
+  let boostTimer = 0;
+  const BOOST_DURATION = 0.35;
+  const BOOST_COOLDOWN = 0.15;
+  let boostCooldownTimer = 0;
+
+  window.addEventListener('mousemove', (e) => {
+    mouse.x = e.clientX;
+    mouse.y = e.clientY;
+    mouse.active = true;
+    cursorEl.style.left = e.clientX + 'px';
+    cursorEl.style.top = e.clientY + 'px';
+    if (hintEl.style.opacity !== '0') hintEl.style.opacity = '0';
+  });
+  window.addEventListener('mouseleave', () => { mouse.active = false; });
+  window.addEventListener('touchmove', (e) => {
+    if (e.touches && e.touches[0]) {
+      mouse.x = e.touches[0].clientX;
+      mouse.y = e.touches[0].clientY;
+      mouse.active = true;
+      hintEl.style.opacity = '0';
+    }
+  }, { passive: true });
+
+  function triggerBoost() {
+    if (boostCooldownTimer > 0) return;
+    boostTimer = BOOST_DURATION;
+    boostCooldownTimer = BOOST_DURATION + BOOST_COOLDOWN;
+    cursorEl.style.transform = 'translate(-50%, -50%) scale(1.8)';
+    cursorEl.style.background = 'rgba(255, 200, 120, 0.9)';
+    setTimeout(() => {
+      cursorEl.style.transform = 'translate(-50%, -50%) scale(1)';
+      cursorEl.style.background = 'rgba(255,255,255,0.5)';
+    }, 180);
+  }
+  window.addEventListener('mousedown', triggerBoost);
+  window.addEventListener('touchstart', triggerBoost, { passive: true });
+
+  // ================================================================
+  // GIF RECORDING — press "R" to start, press "R" again to stop.
+  // Captures the low-res pixel canvas (upscaled with nearest-neighbor
+  // for crisp output), throttled to a fixed capture fps, then encodes
+  // and auto-downloads an animated GIF.
+  // ================================================================
+  const recStatusEl = document.getElementById('recStatus');
+  const recLabelEl = document.getElementById('recLabel');
+  const RECORD = {
+    active: false,
+    encoding: false,
+    gif: null,
+    captureFPS: 15,
+    accum: 0,
+    outScale: 3,          // upscale factor for the exported GIF frames
+    maxSeconds: 20,        // safety cap so recordings can't grow unbounded
+    elapsed: 0,
+    frameCanvas: null,
+    frameCtx: null,
+    starting: false
+  };
+
+  // gif.js spins up Web Workers pointed at its workerScript URL. Workers
+  // cannot be constructed cross-origin, so pointing straight at the CDN
+  // URL fails silently and the encode hangs forever on "finished". Fetch
+  // the worker source once and hand gif.js a same-origin blob: URL instead.
+  let workerBlobUrlPromise = null;
+  function getWorkerBlobUrl() {
+    if (!workerBlobUrlPromise) {
+      workerBlobUrlPromise = fetch('https://cdnjs.cloudflare.com/ajax/libs/gif.js/0.2.0/gif.worker.js')
+        .then(r => {
+          if (!r.ok) throw new Error('worker fetch failed: ' + r.status);
+          return r.text();
+        })
+        .then(text => URL.createObjectURL(new Blob([text], { type: 'application/javascript' })));
+    }
+    return workerBlobUrlPromise;
+  }
+
+  function ensureFrameCanvas() {
+    if (!RECORD.frameCanvas) {
+      RECORD.frameCanvas = document.createElement('canvas');
+      RECORD.frameCtx = RECORD.frameCanvas.getContext('2d');
+      RECORD.frameCtx.imageSmoothingEnabled = false;
+    }
+    RECORD.frameCanvas.width = W * RECORD.outScale;
+    RECORD.frameCanvas.height = H * RECORD.outScale;
+  }
+
+  function showRecError(msg) {
+    recStatusEl.classList.remove('encoding');
+    recStatusEl.classList.add('visible');
+    recLabelEl.textContent = msg;
+    setTimeout(() => recStatusEl.classList.remove('visible'), 3000);
+  }
+
+  function startRecording() {
+    if (RECORD.active || RECORD.encoding || RECORD.starting) return;
+    if (typeof GIF === 'undefined') {
+      showRecError('GIF LIB FAILED TO LOAD');
+      return;
+    }
+    RECORD.starting = true;
+    recLabelEl.textContent = 'PREPARING…';
+    recStatusEl.classList.add('visible');
+
+    getWorkerBlobUrl().then(workerUrl => {
+      ensureFrameCanvas();
+      RECORD.gif = new GIF({
+        workers: 2,
+        quality: 10,
+        width: RECORD.frameCanvas.width,
+        height: RECORD.frameCanvas.height,
+        workerScript: workerUrl
+      });
+      RECORD.active = true;
+      RECORD.starting = false;
+      RECORD.accum = 0;
+      RECORD.elapsed = 0;
+      recStatusEl.classList.remove('encoding');
+      recLabelEl.textContent = 'REC';
+    }).catch(err => {
+      console.error('GIF worker setup failed:', err);
+      RECORD.starting = false;
+      showRecError('RECORDING UNAVAILABLE');
+    });
+  }
+
+  function stopRecording() {
+    if (RECORD.starting) { RECORD.starting = false; recStatusEl.classList.remove('visible'); return; }
+    if (!RECORD.active) return;
+    RECORD.active = false;
+    if (!RECORD.gif || RECORD.gif.frames.length === 0) {
+      recStatusEl.classList.remove('visible');
+      return;
+    }
+    RECORD.encoding = true;
+    recStatusEl.classList.add('encoding');
+    recLabelEl.textContent = 'ENCODING… 0%';
+
+    const failSafe = setTimeout(() => {
+      if (RECORD.encoding) {
+        console.error('GIF encoding timed out');
+        RECORD.encoding = false;
+        showRecError('ENCODING FAILED');
+        RECORD.gif = null;
+      }
+    }, 30000); // if it hasn't finished in 30s, something's wrong — surface it
+
+    RECORD.gif.on('progress', function(p) {
+      recLabelEl.textContent = 'ENCODING… ' + Math.round(p * 100) + '%';
+    });
+
+    RECORD.gif.on('finished', function(blob) {
+      clearTimeout(failSafe);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'drift-recording-' + Date.now() + '.gif';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+
+      RECORD.encoding = false;
+      recStatusEl.classList.remove('visible', 'encoding');
+      RECORD.gif = null;
+    });
+
+    try {
+      RECORD.gif.render();
+    } catch (err) {
+      clearTimeout(failSafe);
+      console.error('GIF render() threw:', err);
+      RECORD.encoding = false;
+      showRecError('ENCODING FAILED');
+      RECORD.gif = null;
+    }
+  }
+
+  function toggleRecording() {
+    if (RECORD.encoding) return; // ignore toggles while a gif is being built
+    if (RECORD.active) stopRecording();
+    else startRecording();
+  }
+
+  function captureFrame(dt) {
+    if (!RECORD.active) return;
+    RECORD.elapsed += dt;
+    if (RECORD.elapsed >= RECORD.maxSeconds) { stopRecording(); return; }
+
+    RECORD.accum += dt;
+    const frameInterval = 1 / RECORD.captureFPS;
+    if (RECORD.accum < frameInterval) return;
+    RECORD.accum -= frameInterval;
+
+    RECORD.frameCtx.imageSmoothingEnabled = false;
+    RECORD.frameCtx.clearRect(0, 0, RECORD.frameCanvas.width, RECORD.frameCanvas.height);
+    RECORD.frameCtx.drawImage(canvas, 0, 0, RECORD.frameCanvas.width, RECORD.frameCanvas.height);
+    RECORD.gif.addFrame(RECORD.frameCtx, { copy: true, delay: Math.round(frameInterval * 1000) });
+  }
+
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'r' || e.key === 'R') {
+      toggleRecording();
+    }
+  });
+
+  // ================================================================
+  // PARTICLE SYSTEM — reusable pooled emitters, bounded lifespans,
+  // dead particles swept each frame so nothing accumulates.
+  // ================================================================
+  class Particle { constructor() { this.active = false; } }
+
+  class ParticlePool {
+    constructor(size) {
+      this.pool = new Array(size);
+      for (let i = 0; i < size; i++) this.pool[i] = new Particle();
+      this.cursor = 0;
+    }
+    spawn(props) {
+      let p = null;
+      for (let i = 0; i < this.pool.length; i++) {
+        const idx = (this.cursor + i) % this.pool.length;
+        if (!this.pool[idx].active) { p = this.pool[idx]; this.cursor = idx + 1; break; }
+      }
+      if (!p) return;
+      for (const k in p) if (k !== 'active') delete p[k];
+      Object.assign(p, props);
+      p.active = true;
+      p.age = 0;
+    }
+    update(dt) {
+      for (let i = 0; i < this.pool.length; i++) {
+        const p = this.pool[i];
+        if (!p.active) continue;
+        p.age += dt;
+        if (p.age >= p.life) { p.active = false; continue; }
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+        if (p.gravity) p.vy += p.gravity * dt;
+        if (p.drag) { const f = clamp(1 - p.drag * dt, 0, 1); p.vx *= f; p.vy *= f; }
+      }
+    }
+    forEachActive(fn) {
+      for (let i = 0; i < this.pool.length; i++) { const p = this.pool[i]; if (p.active) fn(p); }
+    }
+  }
+
+  const flamePool = new ParticlePool(420);
+  const burstPool = new ParticlePool(900);
+
+  // ---------- Engine flame emitter ----------
+  function emitFlame(ship, dt) {
+    const thrust = ship.thrustLevel;
+    const boost = ship.boostFactor;
+    const power = clamp(thrust + boost * 0.9, 0, 1.8);
+    if (power <= 0.02) { ship._flameAccum = 0; return; }
+
+    const rate = lerp(14, 130, clamp(power, 0, 1)) + boost * 160;
+    ship._flameAccum = (ship._flameAccum || 0) + rate * dt;
+
+    const backX = -Math.cos(ship.angle);
+    const backY = -Math.sin(ship.angle);
+    const perpX = -backY, perpY = backX;
+    const nozzleOffset = 6.5;
+
+    let guard = 0;
+    while (ship._flameAccum >= 1 && guard < 40) {
+      ship._flameAccum -= 1;
+      guard++;
+
+      const spread = rand(-0.5, 0.5) * (0.45 + power * 0.9);
+      const speed = lerp(24, 95, clamp(power, 0, 1)) + boost * 70 + rand(-8, 10);
+      const ang = ship.angle + Math.PI + spread;
+      const jitter = rand(-2.2, 2.2) * (0.6 + power * 0.6);
+
+      const ex = ship.x + backX * nozzleOffset + perpX * jitter;
+      const ey = ship.y + backY * nozzleOffset + perpY * jitter;
+
+      const roll = Math.random();
+      let color, sizeMul, lifeMul;
+      if (roll < 0.22 + boost * 0.25) {
+        color = choice(['#ffffff', '#fff8e0', '#fff3c4']);
+        sizeMul = 1.15; lifeMul = 0.8;
+      } else if (roll < 0.62) {
+        color = choice(['#ffd27a', '#ffb85c', '#ff9d4d']);
+        sizeMul = 1.0; lifeMul = 1.0;
+      } else {
+        color = choice(['#ff7a3d', '#ff5a3d', '#c23a3a']);
+        sizeMul = 0.85; lifeMul = 1.25;
+      }
+      const flicker = rand(0.75, 1.3);
+
+      flamePool.spawn({
+        x: ex, y: ey,
+        vx: Math.cos(ang) * speed + ship.vx * 0.35,
+        vy: Math.sin(ang) * speed + ship.vy * 0.35,
+        life: lerp(0.16, 0.48, Math.random()) * lifeMul,
+        size: lerp(1, 3.2, clamp(power, 0, 1)) * sizeMul * flicker,
+        color,
+        drag: 1.3
+      });
+    }
+  }
+
+  function drawFlame(p) {
+    const lifeT = p.age / p.life;
+    const alpha = Math.pow(1 - lifeT, 0.7);
+    const s = Math.max(0.6, p.size * (1 - lifeT * 0.55));
+    const sx = Math.round(p.x), sy = Math.round(p.y);
+    ctx.globalAlpha = clamp(alpha, 0, 1);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(sx - s / 2, sy - s / 2, s, s);
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- Collision burst emitters (per planet "material") ----------
+  const BURST_KINDS = {
+    dust:   { colors: ['#c9b28a','#a88f66','#8a7550','#e2cfa5','#f2e4c4'], speed:[30,130], life:[0.5,1.5], size:[1,3],   gravity:0,   drag:1.6, countMul:1.3, glow:false, trail:false },
+    sparks: { colors: ['#ffe9a8','#ffd166','#ff9f40','#ffffff','#ff6a3d'], speed:[90,320], life:[0.18,0.6],size:[1,2.6], gravity:90,  drag:0.7, countMul:1.7, glow:true,  trail:true },
+    ice:    { colors: ['#e8fbff','#a9e7ff','#7fd6f2','#ffffff','#c8f2ff'], speed:[40,180], life:[0.6,1.7], size:[1,3.4], gravity:24,  drag:1.1, countMul:1.4, glow:true,  trail:false },
+    alien:  { colors: ['#c98bff','#8effe0','#ff8bd8','#b0ffb0','#ffffff'], speed:[25,140], life:[0.7,2.0], size:[1,2.8], gravity:-14, drag:0.9, countMul:1.5, glow:true,  trail:false },
+    solar:  { colors: ['#fff6d0','#ffcf5c','#ff8a3d','#ff5233','#ffffff'], speed:[90,340], life:[0.22,0.75],size:[1,3.6], gravity:0,   drag:0.65,countMul:1.9, glow:true,  trail:true }
+  };
+
+  function emitBurst(x, y, kind, strength) {
+    const cfg = BURST_KINDS[kind] || BURST_KINDS.dust;
+    const s = clamp(strength, 0, 1.6);
+    const count = Math.round(lerp(35, 150, clamp(s, 0, 1)) * cfg.countMul);
+
+    burstPool.spawn({ x, y, vx: 0, vy: 0, life: 0.14, size: lerp(6, 16, s), color: '#ffffff', drag: 0, gravity: 0, glow: true, kind: 'flash' });
+
+    for (let i = 0; i < count; i++) {
+      const ang = rand(0, Math.PI * 2);
+      const spd = rand(cfg.speed[0], cfg.speed[1]) * lerp(0.7, 1.9, s);
+      burstPool.spawn({
+        x: x + rand(-3, 3), y: y + rand(-3, 3),
+        vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd,
+        life: rand(cfg.life[0], cfg.life[1]),
+        size: rand(cfg.size[0], cfg.size[1]) * lerp(0.8, 1.5, s),
+        color: choice(cfg.colors),
+        gravity: cfg.gravity, drag: cfg.drag, glow: cfg.glow, trail: cfg.trail,
+        kind: 'burst'
+      });
+    }
+  }
+
+  function drawBurst(p) {
+    const lifeT = p.age / p.life;
+    const alpha = p.kind === 'flash' ? (1 - lifeT) : Math.pow(1 - lifeT, 0.6);
+    const s = Math.max(0.6, p.size * (1 - lifeT * 0.35));
+    const sx = Math.round(p.x), sy = Math.round(p.y);
+    ctx.globalAlpha = clamp(alpha, 0, 1);
+    if (p.glow) { ctx.shadowColor = p.color; ctx.shadowBlur = p.kind === 'flash' ? 10 : 5; }
+    if (p.trail) {
+      const tx = sx - p.vx * 0.02, ty = sy - p.vy * 0.02;
+      ctx.strokeStyle = p.color;
+      ctx.lineWidth = Math.max(0.6, s * 0.6);
+      ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(tx, ty); ctx.stroke();
+    }
+    ctx.fillStyle = p.color;
+    ctx.fillRect(sx - s / 2, sy - s / 2, s, s);
+    ctx.shadowBlur = 0;
+    ctx.globalAlpha = 1;
+  }
+
+  // ================================================================
+  // SHIP — confined entirely to the fixed screen
+  // ================================================================
+  const ship = { x: 0, y: 0, vx: 0, vy: 0, angle: -Math.PI / 2, thrustLevel: 0, boostFactor: 0, radius: 6.5, _flameAccum: 0 };
+
+  const SHIP_TUNING = {
+    maxSpeed: 190, boostMaxSpeed: 340,
+    accel: 260, boostAccel: 620,
+    drag: 0.55, turnSpeed: 4.4, deadzone: 22,
+    edgeMargin: 14, edgeBounce: 0.5
+  };
+
+  function updateShip(dt) {
+    if (boostTimer > 0) boostTimer = Math.max(0, boostTimer - dt);
+    if (boostCooldownTimer > 0) boostCooldownTimer = Math.max(0, boostCooldownTimer - dt);
+    const desiredBoost = boostTimer > 0 ? (boostTimer / BOOST_DURATION) : 0;
+    ship.boostFactor = lerp(ship.boostFactor, desiredBoost, clamp(dt * 10, 0, 1));
+
+    const targetWX = mouse.x / SCALE;
+    const targetWY = mouse.y / SCALE;
+    const dx = targetWX - ship.x, dy = targetWY - ship.y;
+    const d = Math.sqrt(dx * dx + dy * dy);
+    const targetAngle = Math.atan2(dy, dx);
+
+    let da = targetAngle - ship.angle;
+    while (da > Math.PI) da -= Math.PI * 2;
+    while (da < -Math.PI) da += Math.PI * 2;
+    ship.angle += clamp(da * SHIP_TUNING.turnSpeed, -8, 8) * dt;
+
+    const distFactor = clamp((d * SCALE - SHIP_TUNING.deadzone) / 140, 0, 1);
+    const alignFactor = clamp(1 - Math.abs(da) / (Math.PI * 0.9), 0, 1);
+    const desiredThrust = mouse.active ? distFactor * (0.35 + 0.65 * alignFactor) : 0;
+    ship.thrustLevel = lerp(ship.thrustLevel, desiredThrust, clamp(dt * 5, 0, 1));
+
+    const accel = SHIP_TUNING.accel + ship.boostFactor * SHIP_TUNING.boostAccel;
+    const drivePower = Math.max(ship.thrustLevel, ship.boostFactor * 0.8);
+    ship.vx += Math.cos(ship.angle) * accel * drivePower * dt;
+    ship.vy += Math.sin(ship.angle) * accel * drivePower * dt;
+
+    const dragF = clamp(1 - SHIP_TUNING.drag * dt, 0, 1);
+    ship.vx *= dragF; ship.vy *= dragF;
+
+    const maxSp = lerp(SHIP_TUNING.maxSpeed, SHIP_TUNING.boostMaxSpeed, ship.boostFactor);
+    const speed = Math.sqrt(ship.vx * ship.vx + ship.vy * ship.vy);
+    if (speed > maxSp) { const s = maxSp / speed; ship.vx *= s; ship.vy *= s; }
+
+    ship.x += ship.vx * dt;
+    ship.y += ship.vy * dt;
+
+    // hard screen-space confinement — ship never leaves the canvas
+    const m = SHIP_TUNING.edgeMargin;
+    const minX = m, maxX = W - m, minY = m, maxY = H - m;
+    if (ship.x < minX) { ship.x = minX; if (ship.vx < 0) ship.vx = -ship.vx * SHIP_TUNING.edgeBounce; }
+    if (ship.x > maxX) { ship.x = maxX; if (ship.vx > 0) ship.vx = -ship.vx * SHIP_TUNING.edgeBounce; }
+    if (ship.y < minY) { ship.y = minY; if (ship.vy < 0) ship.vy = -ship.vy * SHIP_TUNING.edgeBounce; }
+    if (ship.y > maxY) { ship.y = maxY; if (ship.vy > 0) ship.vy = -ship.vy * SHIP_TUNING.edgeBounce; }
+
+    emitFlame(ship, dt);
+  }
+
+  function drawShip() {
+    const sx = Math.round(ship.x), sy = Math.round(ship.y);
+    ctx.save();
+    ctx.translate(sx, sy);
+    ctx.rotate(ship.angle);
+
+    const power = clamp(ship.thrustLevel + ship.boostFactor * 0.9, 0, 1.6);
+    if (power > 0.03) {
+      ctx.globalAlpha = clamp(power * 0.28, 0, 0.55);
+      ctx.fillStyle = '#ffb066';
+      ctx.beginPath();
+      ctx.ellipse(-7 - power * 2, 0, 5 + power * 6, 2.2 + power * 2, 0, 0, Math.PI * 2);
+      ctx.fill();
+      if (ship.boostFactor > 0.1) {
+        ctx.globalAlpha = clamp(ship.boostFactor * 0.6, 0, 0.6);
+        ctx.fillStyle = '#fff3c4';
+        ctx.beginPath();
+        ctx.ellipse(-6, 0, 3 + ship.boostFactor * 5, 1.6 + ship.boostFactor * 2, 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    ctx.fillStyle = '#d8dce8';
+    ctx.fillRect(-3, -1, 6, 2);
+    ctx.fillRect(2, -0.5, 2, 1);
+    ctx.fillStyle = '#9aa4c4';
+    ctx.fillRect(-3, -1, 2, 2);
+    ctx.fillStyle = '#5ec9e0';
+    ctx.fillRect(0, -0.5, 1.5, 1);
+
+    ctx.restore();
+  }
+
+  // ================================================================
+  // PLANETS — fixed layout, all visible within the single scene
+  // ================================================================
+  const PLANET_DEFS = [
+    { name: 'ashen dust world', kind: 'dust',   radiusFrac: 0.075, base: '#8a6a4f', shade: '#5b4433', highlight: '#c2a377', texture: 'craters', ringColor: null,       rotSpeed: 0.02 },
+    { name: 'molten core',      kind: 'solar',  radiusFrac: 0.06,  base: '#ff7a3d', shade: '#b23a1f', highlight: '#ffe08a', texture: 'lava',    ringColor: null,       rotSpeed: 0.06, glow: true },
+    { name: 'frozen moon',      kind: 'ice',    radiusFrac: 0.045, base: '#bfe9f5', shade: '#7fb8cc', highlight: '#ffffff', texture: 'cracks',  ringColor: null,       rotSpeed: 0.015 },
+    { name: 'verdant anomaly',  kind: 'alien',  radiusFrac: 0.065, base: '#5fae7a', shade: '#356247', highlight: '#b6ffcf', texture: 'swirl',   ringColor: '#8effe0',  rotSpeed: 0.03, glow: true },
+    { name: 'violet giant',     kind: 'alien',  radiusFrac: 0.095, base: '#8b6fc9', shade: '#4f3d80', highlight: '#e2c9ff', texture: 'bands',   ringColor: '#c98bff',  rotSpeed: 0.008 },
+    { name: 'rust outpost',     kind: 'sparks', radiusFrac: 0.04,  base: '#c97a4a', shade: '#7a4527', highlight: '#ffcf9e', texture: 'craters', ringColor: null,       rotSpeed: 0.025 },
+    { name: 'pale sibling',     kind: 'dust',   radiusFrac: 0.03,  base: '#cfcbd6', shade: '#8f8b99', highlight: '#ffffff', texture: 'cracks',  ringColor: null,       rotSpeed: 0.018 }
+  ];
+
+  const ANCHORS = [
+    { fx: 0.16, fy: 0.22 }, { fx: 0.82, fy: 0.18 }, { fx: 0.30, fy: 0.78 },
+    { fx: 0.68, fy: 0.68 }, { fx: 0.50, fy: 0.38 }, { fx: 0.88, fy: 0.55 }, { fx: 0.12, fy: 0.62 }
+  ];
+
+  const planets = PLANET_DEFS.map((def, i) => Object.assign({}, def, {
+    anchor: ANCHORS[i % ANCHORS.length], x: 0, y: 0, radius: 40, phase: rand(0, Math.PI * 2), cooldown: 0
+  }));
+
+  planets.forEach(p => {
+    p.speckles = [];
+    const n = p.texture === 'craters' ? 10 : (p.texture === 'cracks' ? 7 : 14);
+    for (let i = 0; i < n; i++) {
+      p.speckles.push({ a: rand(0, Math.PI * 2), r: rand(0.15, 0.85), size: rand(0.05, 0.16), tone: rand(0, 1) });
+    }
+  });
+
+  function layoutPlanets() {
+    const minDim = Math.min(W, H);
+    planets.forEach(p => {
+      p.x = p.anchor.fx * W;
+      p.y = p.anchor.fy * H;
+      p.radius = p.radiusFrac * minDim * 1.7;
+    });
+    for (let iter = 0; iter < 30; iter++) {
+      for (let i = 0; i < planets.length; i++) {
+        for (let j = i + 1; j < planets.length; j++) {
+          const a = planets[i], b = planets[j];
+          const minD = a.radius + b.radius + minDim * 0.05;
+          const dx = b.x - a.x, dy = b.y - a.y;
+          const d = Math.sqrt(dx * dx + dy * dy) || 1;
+          if (d < minD) {
+            const push = (minD - d) / 2;
+            const nx = dx / d, ny = dy / d;
+            a.x -= nx * push; a.y -= ny * push;
+            b.x += nx * push; b.y += ny * push;
+          }
+        }
+      }
+    }
+    planets.forEach(p => {
+      p.x = clamp(p.x, p.radius + 10, W - p.radius - 10);
+      p.y = clamp(p.y, p.radius + 10, H - p.radius - 10);
+    });
+    ship.x = clamp(ship.x || W / 2, 10, W - 10);
+    ship.y = clamp(ship.y || H / 2, 10, H - 10);
+  }
+
+  function drawPlanet(p, t) {
+    ctx.save();
+    ctx.translate(p.x, p.y);
+
+    if (p.glow) {
+      const grad = ctx.createRadialGradient(0, 0, p.radius * 0.6, 0, 0, p.radius * 1.6);
+      grad.addColorStop(0, p.base + '55');
+      grad.addColorStop(1, p.base + '00');
+      ctx.fillStyle = grad;
+      ctx.beginPath(); ctx.arc(0, 0, p.radius * 1.6, 0, Math.PI * 2); ctx.fill();
+    }
+
+    ctx.beginPath(); ctx.arc(0, 0, p.radius, 0, Math.PI * 2);
+    ctx.fillStyle = p.base; ctx.fill();
+
+    ctx.save();
+    ctx.beginPath(); ctx.arc(0, 0, p.radius, 0, Math.PI * 2); ctx.clip();
+    ctx.beginPath(); ctx.arc(p.radius * 0.5, p.radius * 0.35, p.radius * 1.05, 0, Math.PI * 2);
+    ctx.fillStyle = p.shade + 'aa'; ctx.fill();
+    ctx.restore();
+
+    const rot = t * p.rotSpeed + p.phase;
+    ctx.save();
+    ctx.beginPath(); ctx.arc(0, 0, p.radius, 0, Math.PI * 2); ctx.clip();
+    p.speckles.forEach(s => {
+      const a = s.a + rot;
+      const px = Math.cos(a) * s.r * p.radius;
+      const py = Math.sin(a) * s.r * p.radius * 0.98;
+      ctx.fillStyle = s.tone > 0.5 ? p.highlight + '66' : p.shade + '88';
+      ctx.beginPath(); ctx.arc(px, py, s.size * p.radius, 0, Math.PI * 2); ctx.fill();
+    });
+    if (p.texture === 'lava') {
+      for (let i = 0; i < 4; i++) {
+        const a = rot * 1.4 + i * 1.6;
+        const px = Math.cos(a) * p.radius * 0.5, py = Math.sin(a) * p.radius * 0.5;
+        ctx.fillStyle = p.highlight + (Math.sin(t * 2 + i) > 0 ? 'cc' : '55');
+        ctx.beginPath(); ctx.arc(px, py, p.radius * 0.1, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+    ctx.restore();
+
+    if (p.ringColor) {
+      ctx.save();
+      ctx.rotate(0.4);
+      ctx.strokeStyle = p.ringColor + '77';
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.ellipse(0, 0, p.radius * 1.35, p.radius * 0.35, 0, 0, Math.PI * 2); ctx.stroke();
+      ctx.restore();
+    }
+
+    ctx.beginPath(); ctx.arc(-p.radius * 0.35, -p.radius * 0.4, p.radius * 0.18, 0, Math.PI * 2);
+    ctx.fillStyle = p.highlight + '33'; ctx.fill();
+
+    ctx.restore();
+    if (p.cooldown > 0) p.cooldown -= 1 / 60;
+  }
+
+  function handleCollisions(dt) {
+    for (const p of planets) {
+      const dx = ship.x - p.x, dy = ship.y - p.y;
+      const d = Math.sqrt(dx * dx + dy * dy);
+      const minD = p.radius + ship.radius;
+      if (d < minD) {
+        const nx = dx / (d || 1), ny = dy / (d || 1);
+        const overlap = minD - d;
+        ship.x += nx * overlap; ship.y += ny * overlap;
+
+        const vn = ship.vx * nx + ship.vy * ny;
+        if (vn < 0) {
+          const restitution = 0.6;
+          ship.vx -= (1 + restitution) * vn * nx;
+          ship.vy -= (1 + restitution) * vn * ny;
+        }
+
+        const impactSpeed = Math.sqrt(ship.vx * ship.vx + ship.vy * ship.vy);
+        if (p.cooldown <= 0) {
+          const strength = clamp(impactSpeed / SHIP_TUNING.maxSpeed, 0.2, 1.6);
+          const ix = ship.x - nx * ship.radius, iy = ship.y - ny * ship.radius;
+          emitBurst(ix, iy, p.kind, strength);
+          p.cooldown = 0.16;
+        }
+      }
+    }
+  }
+
+  // ================================================================
+  // STARFIELD — sparse, twinkling, fixed positions (no scroll)
+  // ================================================================
+  let stars = [];
+  function layoutStars() {
+    stars = [];
+    const layers = [
+      { count: 60, size: 1, baseAlpha: 0.35 },
+      { count: 40, size: 1, baseAlpha: 0.55 },
+      { count: 20, size: 1.5, baseAlpha: 0.8 }
+    ];
+    layers.forEach(layer => {
+      for (let i = 0; i < layer.count; i++) {
+        stars.push({ x: rand(0, W), y: rand(0, H), layerCfg: layer, twinkleSeed: rand(0, 1000), twinkleSpeed: rand(0.4, 1.4) });
+      }
+    });
+  }
+  function drawStars(t) {
+    stars.forEach(s => {
+      const twinkle = 0.5 + 0.5 * Math.sin(t * s.twinkleSpeed + s.twinkleSeed);
+      ctx.globalAlpha = s.layerCfg.baseAlpha * (0.4 + 0.6 * twinkle);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(Math.round(s.x), Math.round(s.y), s.layerCfg.size, s.layerCfg.size);
+    });
+    ctx.globalAlpha = 1;
+  }
+
+  let nebulae = [];
+  function layoutNebulae() {
+    nebulae = [];
+    for (let i = 0; i < 4; i++) {
+      nebulae.push({
+        x: rand(W * 0.1, W * 0.9), y: rand(H * 0.1, H * 0.9),
+        r: rand(Math.min(W, H) * 0.25, Math.min(W, H) * 0.45),
+        color: choice(['#2a1f4d', '#1f3a4d', '#3a1f3f', '#1f2a4d'])
+      });
+    }
+  }
+  function drawNebulae() {
+    nebulae.forEach(n => {
+      const grad = ctx.createRadialGradient(n.x, n.y, 0, n.x, n.y, n.r);
+      grad.addColorStop(0, n.color + '22');
+      grad.addColorStop(1, n.color + '00');
+      ctx.fillStyle = grad;
+      ctx.beginPath(); ctx.arc(n.x, n.y, n.r, 0, Math.PI * 2); ctx.fill();
+    });
+  }
+
+  // ================================================================
+  // MAIN LOOP
+  // ================================================================
+  let lastTime = performance.now();
+  let elapsed = 0;
+
+  function frame(now) {
+    let dt = (now - lastTime) / 1000;
+    dt = Math.min(dt, 1 / 30);
+    lastTime = now;
+    elapsed += dt;
+
+    updateShip(dt);
+    handleCollisions(dt);
+
+    flamePool.update(dt);
+    burstPool.update(dt);
+
+    ctx.clearRect(0, 0, W, H);
+
+    const bgGrad = ctx.createLinearGradient(0, 0, 0, H);
+    bgGrad.addColorStop(0, '#0a0a1a');
+    bgGrad.addColorStop(1, '#05050f');
+    ctx.fillStyle = bgGrad;
+    ctx.fillRect(0, 0, W, H);
+
+    drawNebulae();
+    drawStars(elapsed);
+
+    planets.forEach(p => drawPlanet(p, elapsed));
+
+    burstPool.forEachActive(p => drawBurst(p));
+    flamePool.forEachActive(p => drawFlame(p));
+
+    drawShip();
+
+    captureFrame(dt);
+
+    requestAnimationFrame(frame);
+  }
+
+  // ---------- init ----------
+  resize();
+  layoutStars();
+  layoutNebulae();
+  ship.x = W / 2;
+  ship.y = H / 2;
+  mouse.x = window.innerWidth / 2;
+  mouse.y = window.innerHeight / 2;
+
+  window.addEventListener('resize', () => { resize(); layoutStars(); layoutNebulae(); });
+
+  requestAnimationFrame(frame);
+
+  setTimeout(() => { if (!mouse.active) hintEl.style.opacity = '1'; }, 400);
+
+})();
+</script>
+</body>
+</html>
